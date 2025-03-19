@@ -148,6 +148,28 @@ const MQTTHandler = {
     });
   },
   
+  async disconnect(session) {
+    if (!session.mqttClient) {
+      throw new Error("Not connected to an MQTT broker");
+    }
+    
+    return new Promise((resolve, reject) => {
+      session.mqttClient.end(false, {}, (err) => {
+        if (err) {
+          console.log(`[MQTTX] Disconnect error: ${err.message}`);
+          reject(err);
+        } else {
+          console.log(`[MQTTX] Disconnected from MQTT broker`);
+          session.mqttClient = null;
+          resolve({
+            type: "text",
+            text: "Successfully disconnected from MQTT broker"
+          });
+        }
+      });
+    });
+  },
+  
   // Helper for sending events via SSE
   sendMessageEvent(sseRes, message) {
     if (!sseRes) return;
@@ -252,9 +274,17 @@ const ResponseHandler = {
               },
               required: ["topic", "payload"]
             }
+          },
+          {
+            name: "mqttDisconnect",
+            description: "Disconnects from the currently connected MQTT broker.",
+            inputSchema: {
+              type: "object",
+              properties: {}
+            }
           }
         ],
-        count: 3
+        count: 4
       }
     };
     MQTTHandler.sendMessageEvent(sseRes, toolsList);
@@ -380,6 +410,11 @@ async function handleRequest(rpc, session) {
             
           case "mqttPublish":
             result = await MQTTHandler.publish(session, args);
+            ResponseHandler.sendResult(sseRes, id, { content: [result] });
+            break;
+            
+          case "mqttDisconnect":
+            result = await MQTTHandler.disconnect(session);
             ResponseHandler.sendResult(sseRes, id, { content: [result] });
             break;
             
