@@ -1,0 +1,27 @@
+{
+  "name": "mqttx-sse-server",
+  "version": "1.0.0",
+  "description": "MCP Server with SSE transport implementation example",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "mcp",
+    "sse",
+    "model-context-protocol"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.8.3",
+    "cors": "^2.8.5",
+    "eventsource": "^3.0.5",
+    "express": "^4.18.2",
+    "uuid": "^9.0.0"
+  },
+  "peerDependencies": {
+    "mqtt": "^4.3.7"
+  }
+}
