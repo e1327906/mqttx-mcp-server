@@ -3,6 +3,75 @@ const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
 const mqtt = require("mqtt");
 
+// Custom Logger
+class Logger {
+  static LEVELS = {
+    DEBUG: { value: 0, label: 'DEBUG', color: '\x1b[36m' }, // Cyan
+    INFO: { value: 1, label: 'INFO', color: '\x1b[32m' },   // Green
+    WARN: { value: 2, label: 'WARN', color: '\x1b[33m' },   // Yellow
+    ERROR: { value: 3, label: 'ERROR', color: '\x1b[31m' }, // Red
+  };
+  
+  static currentLevel = Logger.LEVELS.INFO;
+  
+  static formatTime() {
+    const now = new Date();
+    return now.toISOString();
+  }
+  
+  static formatMessage(level, context, message, data = null) {
+    const reset = '\x1b[0m';
+    let logMessage = `${level.color}[${level.label}]\x1b[0m [${this.formatTime()}] [MQTTX:${context}] ${message}`;
+    
+    if (data) {
+      if (typeof data === 'object') {
+        try {
+          // Limit object depth and handle circular references
+          const safeJson = JSON.stringify(data, (key, value) => {
+            if (key === 'mqttClient' || key === 'sseRes') return '[Object]';
+            return value;
+          }, 2);
+          logMessage += `\n${safeJson}`;
+        } catch (e) {
+          logMessage += ` [Object: Unable to stringify]`;
+        }
+      } else {
+        logMessage += ` ${data}`;
+      }
+    }
+    
+    return logMessage;
+  }
+  
+  static debug(context, message, data = null) {
+    if (Logger.currentLevel.value <= Logger.LEVELS.DEBUG.value) {
+      console.log(this.formatMessage(Logger.LEVELS.DEBUG, context, message, data));
+    }
+  }
+  
+  static info(context, message, data = null) {
+    if (Logger.currentLevel.value <= Logger.LEVELS.INFO.value) {
+      console.log(this.formatMessage(Logger.LEVELS.INFO, context, message, data));
+    }
+  }
+  
+  static warn(context, message, data = null) {
+    if (Logger.currentLevel.value <= Logger.LEVELS.WARN.value) {
+      console.warn(this.formatMessage(Logger.LEVELS.WARN, context, message, data));
+    }
+  }
+  
+  static error(context, message, error = null) {
+    if (Logger.currentLevel.value <= Logger.LEVELS.ERROR.value) {
+      if (error instanceof Error) {
+        console.error(this.formatMessage(Logger.LEVELS.ERROR, context, message, error.stack));
+      } else {
+        console.error(this.formatMessage(Logger.LEVELS.ERROR, context, message, error));
+      }
+    }
+  }
+}
+
 // Initialize Express app
 const app = express();
 const port = 4000;
@@ -22,7 +91,7 @@ const SessionManager = {
       initialized: false,
       mqttClient: null
     });
-    console.log(`[MQTTX] New session created: ${sessionId}`);
+    Logger.info("SessionManager", `New session created: ${sessionId}`);
     return sessionId;
   },
   
@@ -33,18 +102,30 @@ const SessionManager = {
   remove(sessionId) {
     const session = this.sessions.get(sessionId);
     if (session && session.mqttClient) {
+      Logger.debug("SessionManager", `Cleaning up MQTT client for session ${sessionId}`);
       session.mqttClient.end();
     }
     this.sessions.delete(sessionId);
-    console.log(`[MQTTX] Session closed: ${sessionId}`);
+    Logger.info("SessionManager", `Session closed: ${sessionId}`);
+  },
+  
+  stats() {
+    return {
+      activeSessions: this.sessions.size,
+      sessionsWithMqttConnections: [...this.sessions.values()].filter(s => s.mqttClient).length
+    };
   }
 };
 
 // MQTT Handler
 const MQTTHandler = {
   async connect(session, args) {
+    const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
+    Logger.info("MQTT", `Connecting to broker`, { sessionId, host: args.host, port: args.port, clientId: args.clientId });
+    
     // Disconnect previous client if exists
     if (session.mqttClient) {
+      Logger.debug("MQTT", `Disconnecting previous client`, { sessionId });
       session.mqttClient.end();
     }
     
@@ -63,23 +144,48 @@ const MQTTHandler = {
     
     try {
       // Connect to broker
+      Logger.debug("MQTT", `Attempting connection to ${url}`, { sessionId, options: { ...options, password: options.password ? '****' : undefined } });
       const client = mqtt.connect(url, options);
       
       // Return a promise that resolves when connected or rejects on error
       return new Promise((resolve, reject) => {
         client.once('connect', () => {
-          console.log(`[MQTTX] Connected to ${url}`);
+          Logger.info("MQTT", `Connected to ${url}`, { sessionId, clientId: args.clientId });
           session.mqttClient = client;
+          
+          // Log all client events for debugging
+          client.on('reconnect', () => {
+            Logger.debug("MQTT", `Reconnecting to broker`, { sessionId });
+          });
+          
+          client.on('close', () => {
+            Logger.debug("MQTT", `Connection closed`, { sessionId });
+          });
+          
+          client.on('error', (err) => {
+            Logger.error("MQTT", `Client error`, { sessionId, error: err.message });
+          });
+          
+          client.on('disconnect', () => {
+            Logger.debug("MQTT", `Received disconnect packet`, { sessionId });
+          });
           
           // Handle incoming messages
           client.on('message', (topic, message) => {
-            console.log(`[MQTTX] Received message on topic ${topic}: ${message.toString()}`);
+            const payload = message.toString();
+            Logger.debug("MQTT", `Received message`, { 
+              sessionId, 
+              topic, 
+              payload: payload.length > 200 ? payload.substring(0, 200) + '...' : payload,
+              length: payload.length
+            });
+            
             // Forward to client via SSE
             this.sendMessageEvent(session.sseRes, {
               method: "notifications/message",
               params: {
                 topic: topic,
-                payload: message.toString()
+                payload: payload
               }
             });
           });
@@ -91,30 +197,39 @@ const MQTTHandler = {
         });
         
         client.once('error', (err) => {
-          console.log(`[MQTTX] Connection error: ${err.message}`);
+          Logger.error("MQTT", `Connection error`, { sessionId, error: err.message });
           reject(err);
         });
       });
     } catch (error) {
-      console.log(`[MQTTX] Connection error: ${error.message}`);
+      Logger.error("MQTT", `Connection error`, { sessionId, error: error.message });
       throw error;
     }
   },
   
   async subscribe(session, args) {
+    const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
+    
     if (!session.mqttClient) {
+      Logger.error("MQTT", `Subscribe failed: Not connected`, { sessionId });
       throw new Error("Not connected to an MQTT broker");
     }
     
     const qos = args.qos || 0;
+    Logger.info("MQTT", `Subscribing to topic`, { sessionId, topic: args.topic, qos });
     
     return new Promise((resolve, reject) => {
-      session.mqttClient.subscribe(args.topic, { qos }, (err) => {
+      session.mqttClient.subscribe(args.topic, { qos }, (err, granted) => {
         if (err) {
-          console.log(`[MQTTX] Subscription error: ${err.message}`);
+          Logger.error("MQTT", `Subscription error`, { sessionId, topic: args.topic, error: err.message });
           reject(err);
         } else {
-          console.log(`[MQTTX] Subscribed to topic ${args.topic} with QoS ${qos}`);
+          Logger.info("MQTT", `Subscribed to topic`, { 
+            sessionId, 
+            topic: args.topic, 
+            qos,
+            granted: granted
+          });
           resolve({
             type: "text",
             text: `Successfully subscribed to MQTT topic '${args.topic}' with QoS ${qos}`
@@ -125,20 +240,33 @@ const MQTTHandler = {
   },
   
   async publish(session, args) {
+    const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
+    
     if (!session.mqttClient) {
+      Logger.error("MQTT", `Publish failed: Not connected`, { sessionId });
       throw new Error("Not connected to an MQTT broker");
     }
     
     const qos = args.qos || 0;
     const retain = args.retain || false;
+    const payload = args.payload;
+    
+    Logger.info("MQTT", `Publishing message`, { 
+      sessionId, 
+      topic: args.topic, 
+      payload: payload.length > 200 ? payload.substring(0, 200) + '...' : payload,
+      length: payload.length,
+      qos, 
+      retain 
+    });
     
     return new Promise((resolve, reject) => {
-      session.mqttClient.publish(args.topic, args.payload, { qos, retain }, (err) => {
+      session.mqttClient.publish(args.topic, payload, { qos, retain }, (err) => {
         if (err) {
-          console.log(`[MQTTX] Publish error: ${err.message}`);
+          Logger.error("MQTT", `Publish error`, { sessionId, topic: args.topic, error: err.message });
           reject(err);
         } else {
-          console.log(`[MQTTX] Published message to topic ${args.topic}`);
+          Logger.debug("MQTT", `Published message successfully`, { sessionId, topic: args.topic });
           resolve({
             type: "text",
             text: `Successfully published message to MQTT topic '${args.topic}' with QoS ${qos}, retain: ${retain}`
@@ -149,17 +277,22 @@ const MQTTHandler = {
   },
   
   async disconnect(session) {
+    const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
+    
     if (!session.mqttClient) {
+      Logger.warn("MQTT", `Disconnect called but not connected`, { sessionId });
       throw new Error("Not connected to an MQTT broker");
     }
+    
+    Logger.info("MQTT", `Disconnecting from broker`, { sessionId });
     
     return new Promise((resolve, reject) => {
       session.mqttClient.end(false, {}, (err) => {
         if (err) {
-          console.log(`[MQTTX] Disconnect error: ${err.message}`);
+          Logger.error("MQTT", `Disconnect error`, { sessionId, error: err.message });
           reject(err);
         } else {
-          console.log(`[MQTTX] Disconnected from MQTT broker`);
+          Logger.info("MQTT", `Disconnected from MQTT broker`, { sessionId });
           session.mqttClient = null;
           resolve({
             type: "text",
@@ -180,6 +313,11 @@ const MQTTHandler = {
       
     sseRes.write(`event: message\n`);
     sseRes.write(`data: ${jsonMessage}\n\n`);
+    
+    Logger.debug("SSE", `Sent message event`, { 
+      messageType: message.method || 'unknown',
+      messageLength: jsonMessage.length
+    });
   }
 };
 
@@ -187,6 +325,7 @@ const MQTTHandler = {
 const ResponseHandler = {
   // Send JSON-RPC error response
   sendError(sseRes, id, code, message) {
+    Logger.warn("RPC", `Sending error response`, { id, code, message });
     const errorRes = {
       jsonrpc: "2.0",
       id: id,
@@ -197,6 +336,7 @@ const ResponseHandler = {
   
   // Send JSON-RPC success response
   sendResult(sseRes, id, result) {
+    Logger.debug("RPC", `Sending success response`, { id });
     const successRes = {
       jsonrpc: "2.0",
       id: id,
@@ -207,6 +347,7 @@ const ResponseHandler = {
   
   // Send capabilities response
   sendCapabilities(sseRes, id) {
+    Logger.debug("RPC", `Sending capabilities response`, { id });
     const capabilities = {
       jsonrpc: "2.0",
       id: id,
@@ -229,6 +370,7 @@ const ResponseHandler = {
   
   // Send list of available tools
   sendToolsList(sseRes, id) {
+    Logger.debug("RPC", `Sending tools list response`, { id });
     const toolsList = {
       jsonrpc: "2.0",
       id: id,
@@ -296,7 +438,8 @@ const ResponseHandler = {
  * Establishes Server-Sent Events connection with the client
  */
 app.get("/mqttx/sse", (req, res) => {
-  console.log("[MQTTX] New SSE connection established");
+  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  Logger.info("HTTP", `New SSE connection established`, { clientIp });
 
   // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -309,16 +452,24 @@ app.get("/mqttx/sse", (req, res) => {
   // Send endpoint information to client
   res.write(`event: endpoint\n`);
   res.write(`data: /mqttx/message?sessionId=${sessionId}\n\n`);
+  Logger.debug("SSE", `Sent endpoint info to client`, { sessionId });
+
+  // Log session stats 
+  Logger.info("Server", `Session stats`, SessionManager.stats());
 
   // Send heartbeat every 10 seconds
   const heartbeat = setInterval(() => {
-    res.write(`event: heartbeat\ndata: ${Date.now()}\n\n`);
+    const timestamp = Date.now();
+    res.write(`event: heartbeat\ndata: ${timestamp}\n\n`);
+    Logger.debug("SSE", `Sent heartbeat`, { sessionId, timestamp });
   }, 10000);
 
   // Cleanup on disconnect
   req.on("close", () => {
     clearInterval(heartbeat);
+    Logger.info("HTTP", `SSE connection closed`, { sessionId });
     SessionManager.remove(sessionId);
+    Logger.info("Server", `Session stats after disconnect`, SessionManager.stats());
   });
 });
 
@@ -330,21 +481,25 @@ app.post("/mqttx/message", async (req, res) => {
   const sessionId = req.query.sessionId;
   const rpc = req.body;
   const method = rpc?.method || "unknown";
+  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   
-  console.log(`[MQTTX] Received ${method} request for session ${sessionId}`);
+  Logger.info("HTTP", `Received ${method} request`, { sessionId, clientIp, requestId: rpc?.id });
 
   // Validate session
   if (!sessionId) {
+    Logger.error("HTTP", `Missing sessionId in request`, { clientIp });
     return res.status(400).json({ error: "Missing sessionId in query parameters" });
   }
   
   const session = SessionManager.get(sessionId);
   if (!session) {
+    Logger.error("HTTP", `Invalid sessionId, no active session found`, { sessionId, clientIp });
     return res.status(404).json({ error: "No active session with that sessionId" });
   }
 
   // Validate JSON-RPC format
   if (!rpc || rpc.jsonrpc !== "2.0" || !rpc.method) {
+    Logger.error("RPC", `Invalid JSON-RPC request`, { sessionId, request: JSON.stringify(rpc) });
     return res.json({
       jsonrpc: "2.0",
       id: rpc?.id ?? null,
@@ -355,18 +510,40 @@ app.post("/mqttx/message", async (req, res) => {
     });
   }
 
+  // Log received parameters if debug level
+  Logger.debug("RPC", `Request parameters`, { 
+    sessionId, 
+    method: rpc.method,
+    params: rpc.params 
+  });
+
   // Send minimal HTTP acknowledgment
   res.json({
     jsonrpc: "2.0",
     id: rpc.id,
     result: { ack: `Received ${rpc.method}` }
   });
+  Logger.debug("HTTP", `Sent acknowledgment response`, { sessionId, requestId: rpc.id });
 
   // Process the request
   try {
+    const startTime = Date.now();
     await handleRequest(rpc, session);
+    const processingTime = Date.now() - startTime;
+    Logger.debug("RPC", `Request processing completed`, { 
+      sessionId, 
+      method: rpc.method, 
+      requestId: rpc.id,
+      processingTime: `${processingTime}ms` 
+    });
   } catch (error) {
-    console.error(`[MQTTX] Error handling request: ${error.message}`);
+    Logger.error("RPC", `Error handling request`, { 
+      sessionId, 
+      method: rpc.method,
+      requestId: rpc.id,
+      error: error.message,
+      stack: error.stack
+    });
     ResponseHandler.sendError(session.sseRes, rpc.id, -32000, error.message);
   }
 });
@@ -375,23 +552,24 @@ app.post("/mqttx/message", async (req, res) => {
 async function handleRequest(rpc, session) {
   const { method, id } = rpc;
   const sseRes = session.sseRes;
+  const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
   
   switch (method) {
     case "initialize":
       session.initialized = true;
-      console.log(`[MQTTX] Initializing session`);
+      Logger.info("RPC", `Initializing session`, { sessionId, requestId: id });
       ResponseHandler.sendCapabilities(sseRes, id);
       break;
       
     case "tools/list":
-      console.log(`[MQTTX] Listing MQTT tools`);
+      Logger.info("RPC", `Listing MQTT tools`, { sessionId, requestId: id });
       ResponseHandler.sendToolsList(sseRes, id);
       break;
       
     case "tools/call":
       const toolName = rpc.params?.name;
       const args = rpc.params?.arguments || {};
-      console.log(`[MQTTX] Tool call: ${toolName}`);
+      Logger.info("RPC", `Tool call`, { sessionId, requestId: id, tool: toolName });
       
       try {
         let result;
@@ -419,30 +597,34 @@ async function handleRequest(rpc, session) {
             break;
             
           default:
-            console.log(`[MQTTX] Unknown tool: ${toolName}`);
+            Logger.warn("RPC", `Unknown tool requested`, { sessionId, requestId: id, tool: toolName });
             ResponseHandler.sendError(sseRes, id, -32601, `No such tool '${toolName}'`);
         }
       } catch (error) {
-        console.error(`[MQTTX] Tool error: ${error.message}`);
+        Logger.error("RPC", `Tool error`, { sessionId, requestId: id, tool: toolName, error: error.message });
         ResponseHandler.sendError(sseRes, id, -32000, `MQTT operation error: ${error.message}`);
       }
       break;
       
     case "notifications/initialized":
-      console.log(`[MQTTX] Client initialized`);
+      Logger.info("RPC", `Client initialized notification received`, { sessionId });
       // No response needed
       break;
       
     default:
-      console.log(`[MQTTX] Unknown method: ${method}`);
+      Logger.warn("RPC", `Unknown method called`, { sessionId, requestId: id, method });
       ResponseHandler.sendError(sseRes, id, -32601, `Method '${method}' not recognized`);
   }
 }
 
 // Start the server
 app.listen(port, () => {
-  console.log(`[MQTTX] Server running at http://localhost:${port}`);
-  console.log(`[MQTTX] Endpoints:`);
-  console.log(`  - GET  /mqttx/sse - establishes SSE connection`);
-  console.log(`  - POST /mqttx/message?sessionId=xxx - handles MQTT commands`);
+  Logger.info("Server", `Server started successfully on port ${port}`, { 
+    endpoints: [
+      `GET  /mqttx/sse - establishes SSE connection`,
+      `POST /mqttx/message?sessionId=xxx - handles MQTT commands`
+    ],
+    version: "1.0.0",
+    node: process.version
+  });
 });
