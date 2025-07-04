@@ -456,6 +456,128 @@ def mqtt_publish(topic: str, payload: Any, qos: int = 0, retain: bool = False) -
         return error_msg
 
 @mcp.tool()
+def mqtt_publish_bulk(topic: str, payload: Any, count: int, qos: int = 0, retain: bool = False, increment_sequence: bool = True, delay_ms: int = 100) -> str:
+    """Publish multiple identical or sequentially numbered messages to an MQTT topic.
+    
+    Args:
+        topic: The MQTT topic to publish to
+        payload: The base message payload (dict/JSON will have sequence numbers incremented if increment_sequence=True)
+        count: Number of messages to send (max 1000 for safety)
+        qos: Quality of Service level (0, 1, or 2). Default is 0.
+        retain: Whether the messages should be retained by the broker. Default is False.
+        increment_sequence: If True and payload is JSON with messageSequenceNumber, increment it for each message
+        delay_ms: Delay between messages in milliseconds (default 100ms, min 10ms)
+    """
+    try:
+        mqtt_conn = get_mqtt_client()
+        if not mqtt_conn or not mqtt_conn.connected:
+            return "Error: Not connected to an MQTT broker. Use mqtt_connect first."
+        
+        if qos not in [0, 1, 2]:
+            return "Error: QoS must be 0, 1, or 2"
+        
+        if count <= 0 or count > 1000:
+            return "Error: Count must be between 1 and 1000"
+        
+        if delay_ms < 10:
+            delay_ms = 10
+        
+        logger.info(f"Starting bulk publish of {count} messages to topic '{topic}' with {delay_ms}ms delay")
+        
+        successful_publishes = 0
+        failed_publishes = 0
+        
+        for i in range(1, count + 1):
+            try:
+                # Prepare payload for this iteration
+                current_payload = payload
+                payload_str = ""
+                
+                if isinstance(payload, dict) and increment_sequence:
+                    # Create a copy and update sequence numbers
+                    import copy
+                    current_payload = copy.deepcopy(payload)
+                    
+                    # Update messageSequenceNumber if it exists
+                    if ("payload" in current_payload and 
+                        "messageHeader" in current_payload["payload"] and 
+                        "messageSequenceNumber" in current_payload["payload"]["messageHeader"]):
+                        current_payload["payload"]["messageHeader"]["messageSequenceNumber"] = i
+                    
+                    # Update deviceSequenceNumber if it exists
+                    if ("payload" in current_payload and 
+                        "messageHeader" in current_payload["payload"] and 
+                        "deviceSequenceNumber" in current_payload["payload"]["messageHeader"]):
+                        base_seq = current_payload["payload"]["messageHeader"]["deviceSequenceNumber"]
+                        current_payload["payload"]["messageHeader"]["deviceSequenceNumber"] = base_seq + i - 1
+                    
+                    # Update timestamp if it exists
+                    if ("payload" in current_payload and 
+                        "messageHeader" in current_payload["payload"] and 
+                        "transactionDateTime" in current_payload["payload"]["messageHeader"]):
+                        import datetime
+                        now = datetime.datetime.now()
+                        timestamp = now + datetime.timedelta(seconds=i-1)
+                        current_payload["payload"]["messageHeader"]["transactionDateTime"] = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # Update ticket number if it exists
+                    if ("payload" in current_payload and 
+                        "qrCodeTicketDataHeader" in current_payload["payload"] and 
+                        "qrTicketNumber" in current_payload["payload"]["qrCodeTicketDataHeader"]):
+                        base_ticket = current_payload["payload"]["qrCodeTicketDataHeader"]["qrTicketNumber"]
+                        # Extract base and update the sequence part
+                        if len(base_ticket) >= 10:
+                            prefix = base_ticket[:-10]
+                            suffix = f"{i:010d}"
+                            current_payload["payload"]["qrCodeTicketDataHeader"]["qrTicketNumber"] = prefix + suffix
+                
+                # Serialize the payload
+                if isinstance(current_payload, (dict, list)):
+                    payload_str = json.dumps(current_payload, ensure_ascii=False, separators=(',', ':'))
+                else:
+                    payload_str = str(current_payload)
+                
+                # Publish the message
+                info = mqtt_conn.client.publish(topic, payload_str, qos, retain)
+                
+                if info.rc == mqtt.MQTT_ERR_SUCCESS:
+                    successful_publishes += 1
+                    if qos > 0:
+                        info.wait_for_publish(timeout=1.0)
+                else:
+                    failed_publishes += 1
+                    logger.warning(f"Failed to publish message {i}, error code: {info.rc}")
+                
+                # Add delay between messages (except for the last one)
+                if i < count:
+                    time.sleep(delay_ms / 1000.0)
+                
+                # Log progress every 10 messages
+                if i % 10 == 0:
+                    logger.debug(f"Published {i}/{count} messages")
+                    
+            except Exception as e:
+                failed_publishes += 1
+                logger.error(f"Error publishing message {i}: {e}")
+        
+        payload_type = detect_payload_type(payload)
+        logger.info(f"Bulk publish completed: {successful_publishes} successful, {failed_publishes} failed")
+        
+        result_msg = f"Bulk publish completed: {successful_publishes}/{count} messages successfully published to topic '{topic}'"
+        if failed_publishes > 0:
+            result_msg += f" ({failed_publishes} failed)"
+        result_msg += f" with QoS {qos}, retain={retain}"
+        if increment_sequence and isinstance(payload, dict):
+            result_msg += " (with sequence number incrementation)"
+        
+        return result_msg
+        
+    except Exception as e:
+        error_msg = f"Bulk publish error: {str(e)}"
+        logger.error(error_msg)
+        return error_msg
+
+@mcp.tool()
 def mqtt_get_received_messages(topic_filter: Optional[str] = None, limit: int = 10) -> str:
     """Get recently received messages from subscribed topics.
     
