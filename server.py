@@ -29,16 +29,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger('mqtt-mcp-server')
 
-# Initialize server with capabilities
-mcp = FastMCP(
-    "MQTT Client",
-    capabilities={
-        "tools": True,      # Enable tool support
-        "logging": True,    # Enable logging support
-        "resources": False, # We don't use resources
-        "prompts": False   # We don't use prompts
-    }
-)
+# Initialize server
+mcp = FastMCP("MQTT Client")
 
 # Parse command line arguments for MQTT connection defaults
 parser = argparse.ArgumentParser(description="MQTT MCP server")
